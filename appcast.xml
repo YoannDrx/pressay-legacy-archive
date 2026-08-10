@@ -3,6 +3,15 @@
     <channel>
         <title>Pressay</title>
         <item>
+            <title>1.2.5</title>
+            <pubDate>Mon, 10 Aug 2026 11:48:59 +0000</pubDate>
+            <link>https://github.com/YoannDrx/pressay</link>
+            <sparkle:version>12104</sparkle:version>
+            <sparkle:shortVersionString>1.2.5</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/YoannDrx/pressay/releases/download/v1.2.5/Pressay.dmg" length="4932329" type="application/octet-stream" sparkle:edSignature="WGg2o/1NtmI4326cnF4ePpOrijDOAgmlW1/X5DYyhd7RJBdVwDGqgeJpItzJ51ARW/IvIwDETp7bvo6BwCodAA==" />
+        </item>
+    <item>
             <title>1.2.4</title>
             <pubDate>Tue, 04 Aug 2026 10:35:38 +0000</pubDate>
             <link>https://github.com/YoannDrx/pressay</link>
@@ -19,15 +28,6 @@
             <sparkle:shortVersionString>1.2.3</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <enclosure url="https://github.com/YoannDrx/pressay/releases/download/v1.2.3/Pressay.dmg" length="4730448" type="application/octet-stream" sparkle:edSignature="yh8dQdCOww5cuCDzlZcenx8N4eflnCLzoncsMVBAJU35LPCrdsIFrFAsxuePl87ynwJUsnMvscHqD8mLKx88DA==" />
-        </item>
-    <item>
-            <title>1.2.2</title>
-            <pubDate>Fri, 31 Jul 2026 19:22:42 +0000</pubDate>
-            <link>https://github.com/YoannDrx/pressay</link>
-            <sparkle:version>12101</sparkle:version>
-            <sparkle:shortVersionString>1.2.2</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/YoannDrx/pressay/releases/download/v1.2.2/Pressay.dmg" length="3150763" type="application/octet-stream" sparkle:edSignature="eYE/gq1kg3R+l34866A0JXUZicQw9IkFpv+uPX+dCWS7VF2VQmgkFVGrgzpNoznlu4d1X+cVlKDZ1yIrrFyJBw==" />
         </item>
     </channel>
 </rss>
