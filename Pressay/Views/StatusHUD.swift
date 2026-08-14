@@ -16,7 +16,7 @@ enum HUDState: Equatable {
         case .transcribing: return "Transcription…"
         case .processing: return "Transformation…"
         case .delivering: return "Insertion…"
-        case .success: return "Texte inséré"
+        case .success: return "Texte envoyé"
         case .copied: return "Texte copié"
         case .cancelled: return "Annulé"
         }
@@ -73,6 +73,7 @@ final class StatusHUDController: ObservableObject {
     private var onSelectMode: ((UUID) -> Void)?
     private var panel: NSPanel?
     private var hideTask: Task<Void, Never>?
+    private var terminalHardHideTask: Task<Void, Never>?
     private var autoHideRequested = false
     private var pointerIsInside = false
 
@@ -82,6 +83,8 @@ final class StatusHUDController: ObservableObject {
         autoHide: Bool = false
     ) {
         hideTask?.cancel()
+        terminalHardHideTask?.cancel()
+        terminalHardHideTask = nil
         refreshPreferences()
         autoHideRequested = autoHide
         self.state = state
@@ -117,6 +120,8 @@ final class StatusHUDController: ObservableObject {
     func hide() {
         hideTask?.cancel()
         hideTask = nil
+        terminalHardHideTask?.cancel()
+        terminalHardHideTask = nil
         autoHideRequested = false
         pointerIsInside = false
         panel?.orderOut(nil)
@@ -124,6 +129,12 @@ final class StatusHUDController: ObservableObject {
 
     func setPointerInside(_ isInside: Bool) {
         pointerIsInside = isInside
+        // A terminal result is informational: hovering it must not leave the
+        // HUD pinned on screen after the text has already been delivered.
+        if state == .success || state == .copied || state == .cancelled {
+            scheduleAutoHideIfNeeded()
+            return
+        }
         if isInside {
             hideTask?.cancel()
             hideTask = nil
@@ -201,7 +212,11 @@ final class StatusHUDController: ObservableObject {
     }
 
     private func scheduleAutoHideIfNeeded() {
-        guard autoHideRequested, !pointerIsInside else { return }
+        guard autoHideRequested else { return }
+        scheduleTerminalHardHideIfNeeded()
+        let isTerminal = state == .success || state == .copied
+            || state == .cancelled
+        guard isTerminal || !pointerIsInside else { return }
         hideTask?.cancel()
         hideTask = Task { [weak self] in
             let delay: Duration
@@ -213,6 +228,22 @@ final class StatusHUDController: ObservableObject {
                 delay = .milliseconds(600)
             }
             try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            self?.hide()
+        }
+    }
+
+    private func scheduleTerminalHardHideIfNeeded() {
+        guard terminalHardHideTask == nil,
+              resultDuration.delay != nil,
+              state == .success || state == .copied else {
+            return
+        }
+        // Hover still gives time to use result actions, but a completed HUD
+        // must never remain stuck forever because an enter/exit event was
+        // missed while the panel was resized or repositioned.
+        terminalHardHideTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
             self?.hide()
         }
@@ -264,9 +295,10 @@ final class StatusHUDController: ObservableObject {
     }
 
     fileprivate var panelSize: NSSize {
-        hudSize == .compact
-            ? NSSize(width: 380, height: 52)
-            : NSSize(width: 430, height: 60)
+        if hudSize == .compact {
+            return NSSize(width: 380, height: 52)
+        }
+        return NSSize(width: 430, height: 60)
     }
 
     private func refreshPreferences() {
@@ -375,6 +407,7 @@ private struct StatusHUDView: View {
                         "\(Int(controller.audioLevel * 100)) pour cent"
                     )
                 }
+
             }
             Spacer(minLength: 0)
             if controller.state == .listening,

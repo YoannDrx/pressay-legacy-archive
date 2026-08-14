@@ -158,6 +158,10 @@ actor ClipboardTransactionCoordinator {
         return posted
     }
 
+    func pasteDictation(_ text: String) async -> Bool {
+        await pasteDictation(text, processIdentifier: nil)
+    }
+
     func pasteDictationUsingApplicationMenu(
         _ text: String,
         processIdentifier: pid_t
@@ -193,12 +197,14 @@ actor ClipboardTransactionCoordinator {
         return pressed
     }
 
-    func pasteDictation(_ text: String) async -> Bool {
+    func pasteDictation(
+        _ text: String,
+        processIdentifier: pid_t?
+    ) async -> Bool {
         // Dictation keeps the short paste delay, but the user's clipboard is a
         // separate piece of state and must survive a successful insertion.
         // On failure, leaving the dictated text in place keeps it recoverable.
         guard tryAcquire() else { return false }
-        defer { release() }
 
         let initial = await MainActor.run {
             PasteboardSnapshotCodec.snapshot(NSPasteboard.general)
@@ -212,19 +218,43 @@ actor ClipboardTransactionCoordinator {
             }
             return pasteboard.changeCount
         }
-        guard let pressayChangeCount else { return false }
+        guard let pressayChangeCount else {
+            release()
+            return false
+        }
         let posted = await MainActor.run {
-            Self.postKeyboardShortcut(keyCode: CGKeyCode(kVK_ANSI_V))
+            Self.postKeyboardShortcut(
+                keyCode: CGKeyCode(kVK_ANSI_V),
+                processIdentifier: processIdentifier
+            )
         }
-        if posted {
+        guard posted else {
+            release()
+            return false
+        }
+        // The target receives Cmd+V synchronously. Clipboard preservation is
+        // intentionally completed after this method returns so neither the
+        // terminal HUD nor the coordinator waits for the grace period.
+        Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(120))
+            await self?.finishDictationPaste(
+                initial: initial,
+                expectedChangeCount: pressayChangeCount
+            )
         }
+        return true
+    }
+
+    private func finishDictationPaste(
+        initial: [PasteboardItemSnapshot],
+        expectedChangeCount: Int
+    ) async {
         await restoreIfUnchanged(
             initial,
-            expectedChangeCount: pressayChangeCount,
-            pasteSucceeded: posted
+            expectedChangeCount: expectedChangeCount,
+            pasteSucceeded: true
         )
-        return posted
+        release()
     }
 
     func setPermanentString(_ text: String) async {
@@ -279,7 +309,10 @@ actor ClipboardTransactionCoordinator {
     }
 
     @MainActor
-    private static func postKeyboardShortcut(keyCode: CGKeyCode) -> Bool {
+    private static func postKeyboardShortcut(
+        keyCode: CGKeyCode,
+        processIdentifier: pid_t? = nil
+    ) -> Bool {
         guard let source = CGEventSource(stateID: .hidSystemState),
               let keyDown = CGEvent(
                 keyboardEventSource: source,
@@ -295,8 +328,13 @@ actor ClipboardTransactionCoordinator {
         }
         keyDown.flags = .maskCommand
         keyUp.flags = .maskCommand
-        keyDown.post(tap: .cghidEventTap)
-        keyUp.post(tap: .cghidEventTap)
+        if let processIdentifier {
+            keyDown.postToPid(processIdentifier)
+            keyUp.postToPid(processIdentifier)
+        } else {
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+        }
         return true
     }
 
@@ -434,5 +472,6 @@ actor ClipboardTransactionCoordinator {
         }
         return (value as? NSNumber)?.boolValue
     }
+
 }
 #endif

@@ -38,10 +38,10 @@ final class OpenAITextProcessingService: TextProcessing {
             throw ProcessingError.noAPIKey
         }
         let urlRequest = try makeRequest(for: request, apiKey: apiKey)
-        let text: String
+        let decoded: DecodedProcessingResponse
         var requestMetrics: [NetworkRequestMetrics] = []
         do {
-            text = try await ProviderFailurePolicy.performWithOneSafeRetry {
+            decoded = try await ProviderFailurePolicy.performWithOneSafeRetry {
                 let collector = NetworkTaskMetricsCollector()
                 let startedAt = Date()
                 let data: Data
@@ -65,7 +65,10 @@ final class OpenAITextProcessingService: TextProcessing {
                     )
                 )
                 try Task.checkCancellation()
-                return try self.decodeResponse(data: data, response: response)
+                return try self.decodeDetailedResponse(
+                    data: data,
+                    response: response
+                )
             }
         } catch {
             if Task.isCancelled
@@ -85,9 +88,10 @@ final class OpenAITextProcessingService: TextProcessing {
             )
         }
         return TextProcessingResult(
-            text: text,
+            text: decoded.text,
             providerIdentifier: identifier,
-            networkMetrics: .combined(requestMetrics)
+            networkMetrics: .combined(requestMetrics),
+            tokenUsage: decoded.tokenUsage
         )
     }
 
@@ -103,9 +107,17 @@ final class OpenAITextProcessingService: TextProcessing {
         let context = processingRequest.context.restricted(
             to: processingRequest.mode.allowedContextSources
         )
+        let accelerated = defaults.bool(
+            forKey: Constants.acceleratedTextProcessingEnabledKey
+        )
         let body = ResponseRequest(
             model: model,
-            instructions: Self.instructions(for: processingRequest.mode),
+            instructions: Self.instructions(
+                for: processingRequest.mode,
+                translationTargetLanguage: defaults.string(
+                    forKey: Constants.translationTargetLanguageKey
+                )
+            ),
             input: Self.input(
                 text: processingRequest.text,
                 mode: processingRequest.mode,
@@ -114,7 +126,10 @@ final class OpenAITextProcessingService: TextProcessing {
             store: false,
             reasoning: .init(effort: "none"),
             text: .init(verbosity: "low"),
-            maxOutputTokens: 2_048
+            maxOutputTokens: Self.outputTokenLimit(
+                for: processingRequest.text
+            ),
+            serviceTier: accelerated ? "fast" : nil
         )
 
         var request = URLRequest(url: url)
@@ -125,8 +140,22 @@ final class OpenAITextProcessingService: TextProcessing {
         return request
     }
 
-    static func instructions(for mode: ModeDefinition) -> String {
-        """
+    static func instructions(
+        for mode: ModeDefinition,
+        translationTargetLanguage: String? = nil
+    ) -> String {
+        let modePrompt: String
+        if mode.id == NativeModeCatalog.translationID,
+           let translationTargetLanguage,
+           !translationTargetLanguage.isEmpty {
+            let target = translationTargetLanguage == "fr"
+                ? "français"
+                : "anglais"
+            modePrompt = "Traduis intégralement en \(target). Préserve le sens, le ton, les noms propres et la mise en forme."
+        } else {
+            modePrompt = mode.prompt
+        }
+        return """
         Tu es le moteur de transformation de texte de Pressay.
         Respecte le sens, les faits, les noms propres et la langue demandée.
         N’ajoute aucun fait, destinataire, engagement, date ou action absent.
@@ -135,7 +164,7 @@ final class OpenAITextProcessingService: TextProcessing {
         Retourne uniquement le texte final, sans préambule ni explication.
 
         Mode \(mode.name) :
-        \(mode.prompt)
+        \(modePrompt)
         """
     }
 
@@ -192,7 +221,21 @@ final class OpenAITextProcessingService: TextProcessing {
         return sections.joined(separator: "\n\n")
     }
 
+    static func outputTokenLimit(for input: String) -> Int {
+        // A dictation rewrite should stay close to the source length. Keeping
+        // a bounded safety margin avoids reserving a 2K-token generation for
+        // every short translation while still allowing substantial expansion.
+        min(2_048, max(256, input.count))
+    }
+
     func decodeResponse(data: Data, response: URLResponse) throws -> String {
+        try decodeDetailedResponse(data: data, response: response).text
+    }
+
+    private func decodeDetailedResponse(
+        data: Data,
+        response: URLResponse
+    ) throws -> DecodedProcessingResponse {
         guard let http = response as? HTTPURLResponse else {
             throw ProcessingError.invalidResponse
         }
@@ -221,7 +264,13 @@ final class OpenAITextProcessingService: TextProcessing {
         guard !text.isEmpty else {
             throw ProcessingError.emptyResponse
         }
-        return text
+        let tokenUsage = decoded.usage.map {
+            OpenAITokenUsage(
+                inputTokens: $0.inputTokens,
+                outputTokens: $0.outputTokens
+            )
+        }
+        return DecodedProcessingResponse(text: text, tokenUsage: tokenUsage)
     }
 
     private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
@@ -253,6 +302,7 @@ final class OpenAITextProcessingService: TextProcessing {
         let reasoning: Reasoning
         let text: TextConfiguration
         let maxOutputTokens: Int
+        let serviceTier: String?
 
         enum CodingKeys: String, CodingKey {
             case model
@@ -262,6 +312,7 @@ final class OpenAITextProcessingService: TextProcessing {
             case reasoning
             case text
             case maxOutputTokens = "max_output_tokens"
+            case serviceTier = "service_tier"
         }
     }
 
@@ -275,7 +326,23 @@ final class OpenAITextProcessingService: TextProcessing {
             let text: String?
         }
 
+        struct Usage: Decodable {
+            let inputTokens: Int
+            let outputTokens: Int
+
+            enum CodingKeys: String, CodingKey {
+                case inputTokens = "input_tokens"
+                case outputTokens = "output_tokens"
+            }
+        }
+
         let output: [OutputItem]
+        let usage: Usage?
+    }
+
+    private struct DecodedProcessingResponse {
+        let text: String
+        let tokenUsage: OpenAITokenUsage?
     }
 
     private struct ErrorResponse: Decodable {

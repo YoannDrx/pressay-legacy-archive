@@ -20,10 +20,12 @@ struct SettingsView: View {
 
     @AppStorage(Constants.transcriptionLanguageKey)
     private var language = Constants.defaultTranscriptionLanguage
-    @AppStorage(Constants.transcriptionModelKey)
-    private var model = Constants.defaultTranscriptionModel
     @AppStorage(Constants.processingModelKey)
     private var processingModel = Constants.defaultProcessingModel
+    @AppStorage(Constants.acceleratedTextProcessingEnabledKey)
+    private var acceleratedTextProcessingEnabled = false
+    @AppStorage(Constants.translationTargetLanguageKey)
+    private var translationTargetLanguage = Constants.defaultTranslationTargetLanguage
     @AppStorage(Constants.transcriptionEngineKey)
     private var transcriptionEngine = TranscriptionEngine.openAI.rawValue
     @AppStorage(Constants.vocabularyProfileKey)
@@ -281,7 +283,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("OpenAI")
                         .font(.system(size: 12, weight: .semibold))
-                    Text("gpt-4o-mini-transcribe · rapide et fiable")
+                    Text("gpt-4o-mini-transcribe · rapide et économique")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
@@ -388,10 +390,43 @@ struct SettingsView: View {
                     Text("Automatique").tag("")
                 }
                 Divider().opacity(0.45)
-                settingPicker(title: "Modèle", detail: "Même API, compromis coût / précision.", selection: $model) {
-                    ForEach(TranscriptionModel.allCases) { item in
-                        Text(item.label).tag(item.rawValue)
+                if transcriptionEngine == TranscriptionEngine.openAI.rawValue {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Transcription OpenAI")
+                                .font(.system(size: 12, weight: .medium))
+                            Text("Un seul appel de fichier après le relâchement de Fn.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text("GPT-4o Mini")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.blue)
                     }
+                    Text(OpenAITranscriptionProfile.mini.detail)
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.secondary)
+                    Text(
+                        "Pressay ferme le fichier audio au relâchement, l’envoie une seule fois à GPT-4o Mini Transcribe, puis envoie immédiatement le résultat final à l’application active. Aucune session temps réel n’est ouverte."
+                    )
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.secondary)
+                    HStack(spacing: 12) {
+                        Link(
+                            "Fichiers ↗",
+                            destination: URL(
+                                string: "https://developers.openai.com/api/docs/guides/speech-to-text"
+                            )!
+                        )
+                        Link(
+                            "Tarifs ↗",
+                            destination: URL(
+                                string: "https://developers.openai.com/api/docs/pricing"
+                            )!
+                        )
+                    }
+                    .font(.system(size: 9.5))
                 }
                 Divider().opacity(0.45)
                 settingPicker(title: "Profil de vocabulaire", detail: "Seul le profil actif est envoyé avec l’audio.", selection: $vocabularyProfile) {
@@ -485,6 +520,17 @@ struct SettingsView: View {
                         Text(mode.name).tag(mode.id)
                     }
                 }
+                if modes.selectedModeID == NativeModeCatalog.translationID {
+                    Divider().opacity(0.45)
+                    settingPicker(
+                        title: "Langue de traduction",
+                        detail: "Cible explicite utilisée par la traduction directe et son repli.",
+                        selection: $translationTargetLanguage
+                    ) {
+                        Text("Anglais").tag("en")
+                        Text("Français").tag("fr")
+                    }
+                }
                 Divider().opacity(0.45)
                 settingPicker(
                     title: "Traitement cloud",
@@ -495,6 +541,16 @@ struct SettingsView: View {
                     Text("GPT-5.6 Terra").tag("gpt-5.6-terra")
                     Text("GPT-5.6 Sol").tag("gpt-5.6-sol")
                 }
+                Toggle(
+                    "Traitement texte prioritaire (coût API supérieur)",
+                    isOn: $acceleratedTextProcessingEnabled
+                )
+                .font(.system(size: 11, weight: .medium))
+                Text(
+                    "Utilise le niveau de service Fast pour Traduction et les autres styles. La transcription Fidèle n’est pas concernée."
+                )
+                .font(.system(size: 9.5))
+                .foregroundStyle(.secondary)
                 Label(
                     "Les modes « Cloud autorisé » s’exécutent directement. Seules leurs sources autorisées sont envoyées et store: false désactive leur conservation comme état applicatif.",
                     systemImage: "lock.shield"

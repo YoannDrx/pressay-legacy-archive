@@ -112,7 +112,94 @@ final class TextInjector: TextDelivering {
     }
 
     func injectDictation(text: String, target: TextInjectionTarget?) async -> Bool {
-        await deliver(text: text, target: target, isInstantDictation: true)
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else { return fail(.emptyText) }
+        guard TextInjector.hasAccessibilityPermission() else {
+            return fail(.accessibilityNotGranted)
+        }
+        guard let target else { return fail(.missingTarget) }
+        guard !target.snapshot.isSecure else { return fail(.secureTarget) }
+        guard let app = NSRunningApplication(
+            processIdentifier: target.processIdentifier
+        ), !app.isTerminated else {
+            return fail(.targetApplicationUnavailable)
+        }
+
+        lastUndoToken = nil
+        lastDeliveryStrategy = .copied
+        lastDeliveryFailure = nil
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier
+                == target.processIdentifier else {
+            return fail(.targetApplicationNotFrontmost)
+        }
+
+        // Pressay 1.2.7 used the target application's native Edit > Paste
+        // command for Electron and browser editors. Unlike a synthetic CGEvent,
+        // AXPress reports whether the application accepted the menu action.
+        let didUseApplicationMenu = await ClipboardTransactionCoordinator.shared
+            .pasteDictationUsingApplicationMenu(
+                cleanText,
+                processIdentifier: target.processIdentifier
+            )
+        if didUseApplicationMenu {
+            lastDeliveryStrategy = .paste
+            logger.notice(
+                "Native application-menu paste accepted: pid=\(target.processIdentifier, privacy: .public)"
+            )
+            return true
+        }
+
+        // Some small native applications do not expose a conventional Paste
+        // menu item. Keep the historical global shortcut only as a fallback.
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(cleanText, forType: .string) else {
+            return fail(.clipboardPasteFailed)
+        }
+
+        // NSPasteboard writes are handed to the shared pasteboard server. Give
+        // it one short scheduling window before asking Electron/WebKit to read
+        // the new value, then emit a real key-down/key-up gesture instead of
+        // posting both events in the same run-loop instant.
+        do {
+            try await Task.sleep(for: .milliseconds(35))
+        } catch {
+            return fail(.clipboardPasteFailed)
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier
+                == target.processIdentifier else {
+            return fail(.targetApplicationNotFrontmost)
+        }
+        let didPaste = await Self.postPasteShortcut()
+        lastDeliveryStrategy = didPaste ? .paste : .copied
+        logger.notice(
+            "Simple dictation paste posted: success=\(didPaste, privacy: .public), pid=\(target.processIdentifier, privacy: .public)"
+        )
+        return didPaste ? true : fail(.clipboardPasteFailed)
+    }
+
+    private static func postPasteShortcut() async -> Bool {
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let keyDown = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: CGKeyCode(kVK_ANSI_V),
+                  keyDown: true
+              ),
+              let keyUp = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: CGKeyCode(kVK_ANSI_V),
+                  keyDown: false
+              ) else {
+            return false
+        }
+        keyDown.flags = .maskCommand
+        keyUp.flags = .maskCommand
+        keyDown.post(tap: .cghidEventTap)
+        // Always emit key-up, including if the parent task is cancelled while
+        // the gesture is in flight, so Command can never remain logically held.
+        try? await Task.sleep(for: .milliseconds(15))
+        keyUp.post(tap: .cghidEventTap)
+        return true
     }
 
     private func deliver(
@@ -149,21 +236,28 @@ final class TextInjector: TextDelivering {
         lastDeliveryStrategy = .copied
         lastDeliveryFailure = nil
 
+        let targetBundleIdentifier = target.snapshot.bundleIdentifier ?? "unknown"
+        let deliveryStartedAt = Date()
+        logger.notice(
+            "Delivery started: instant=\(isInstantDictation, privacy: .public), target=\(targetBundleIdentifier, privacy: .public), pid=\(target.processIdentifier, privacy: .public), prefersPaste=\(prefersPaste, privacy: .public)"
+        )
+
         guard await restoreTargetApplication(
             app,
-            processIdentifier: target.processIdentifier
+            processIdentifier: target.processIdentifier,
+            isInstantDictation: isInstantDictation
         ) else {
             return fail(.targetApplicationNotFrontmost)
         }
         guard windowStillMatches(target) else {
             return fail(.targetWindowChanged)
         }
-        let usesApplicationMenuPaste = DeliveryPreferencePolicy
-            .shouldUseApplicationMenuPaste(
+        let usesTargetedPaste = DeliveryPreferencePolicy
+            .shouldUseTargetedPaste(
                 prefersPaste: prefersPaste,
                 isInstantDictation: isInstantDictation
             )
-        if MissingAccessibilityTargetPolicy.canUseApplicationMenuPaste(
+        if MissingAccessibilityTargetPolicy.canUseTargetedPaste(
             bundleIdentifier: target.snapshot.bundleIdentifier,
             isInstantDictation: isInstantDictation,
             prefersPaste: prefersPaste,
@@ -171,20 +265,23 @@ final class TextInjector: TextDelivering {
             hasFocusedElement: target.focusedElement != nil
         ) {
             logger.info(
-                "Using application-menu compatibility delivery for accessibility-limited target"
+                "Using targeted shortcut delivery for accessibility-limited target"
             )
             let didPaste = await ClipboardTransactionCoordinator.shared
-                .pasteDictationUsingApplicationMenu(
+                .pasteDictation(
                     cleanText,
                     processIdentifier: target.processIdentifier
                 )
             lastDeliveryStrategy = didPaste ? .paste : .copied
+            logger.notice(
+                "Targeted-shortcut delivery ended: success=\(didPaste, privacy: .public), duration=\(Date().timeIntervalSince(deliveryStartedAt), format: .fixed(precision: 3), privacy: .public)s"
+            )
             return didPaste ? true : fail(.clipboardPasteFailed)
         }
         guard let currentFocusedElement = currentFocusedElement(
             processIdentifier: target.processIdentifier
         ) else {
-            if BrowserFocusLossPastePolicy.canUseApplicationMenuPaste(
+            if BrowserFocusLossPastePolicy.canUseTargetedPaste(
                 bundleIdentifier: target.snapshot.bundleIdentifier,
                 isInstantDictation: isInstantDictation,
                 prefersPaste: prefersPaste,
@@ -192,14 +289,17 @@ final class TextInjector: TextDelivering {
                 isSecure: target.snapshot.isSecure
             ) {
                 logger.info(
-                    "Using browser focus-loss compatibility delivery"
+                    "Using targeted shortcut delivery after browser focus loss"
                 )
                 let didPaste = await ClipboardTransactionCoordinator.shared
-                    .pasteDictationUsingApplicationMenu(
+                    .pasteDictation(
                         cleanText,
                         processIdentifier: target.processIdentifier
                     )
                 lastDeliveryStrategy = didPaste ? .paste : .copied
+                logger.notice(
+                    "Browser-focus delivery ended: success=\(didPaste, privacy: .public), duration=\(Date().timeIntervalSince(deliveryStartedAt), format: .fixed(precision: 3), privacy: .public)s"
+                )
                 return didPaste ? true : fail(.clipboardPasteFailed)
             }
             return fail(.focusedElementUnavailable)
@@ -219,32 +319,23 @@ final class TextInjector: TextDelivering {
             expectedValue(afterInserting: cleanText, in: $0)
         }
 
-        if usesApplicationMenuPaste,
-           await ClipboardTransactionCoordinator.shared
-            .pasteDictationUsingApplicationMenu(
-                cleanText,
-                processIdentifier: activeTarget.processIdentifier
-            ) {
-            if let element = activeTarget.focusedElement,
-               let expectedPastedValue,
-               !(await value(of: element, becomes: expectedPastedValue.value)) {
-                guard ApplicationMenuPasteVerificationPolicy
-                    .allowsStaleAccessibilityValue(
-                        bundleIdentifier: activeTarget.snapshot.bundleIdentifier
-                    ) else {
-                    return fail(.clipboardPasteFailed)
-                }
-                // Codex applies the menu paste immediately but can keep
-                // publishing its pre-paste AXValue. Treating that stale value
-                // as a delivery failure causes the coordinator to copy the
-                // dictation permanently, overwriting the clipboard that the
-                // transaction has just restored.
-                logger.debug(
-                    "Application menu accepted paste before AXValue caught up"
+        if usesTargetedPaste {
+            let didPaste = await ClipboardTransactionCoordinator.shared
+                .pasteDictation(
+                    cleanText,
+                    processIdentifier: activeTarget.processIdentifier
                 )
+            guard didPaste else {
+                logger.error("Target application refused the targeted paste shortcut")
+                return fail(.clipboardPasteFailed)
             }
-            rememberUndo(for: activeTarget, insertedText: cleanText)
+            if activeTarget.selectionRange != nil {
+                rememberUndo(for: activeTarget, insertedText: cleanText)
+            }
             lastDeliveryStrategy = .paste
+            logger.notice(
+                "Delivery completed with targeted paste in \(Date().timeIntervalSince(deliveryStartedAt), format: .fixed(precision: 3), privacy: .public)s"
+            )
             return true
         }
 
@@ -263,12 +354,24 @@ final class TextInjector: TextDelivering {
         }
 
         let pasteWasPosted = if isInstantDictation {
-            await ClipboardTransactionCoordinator.shared.pasteDictation(cleanText)
+            await ClipboardTransactionCoordinator.shared.pasteDictation(
+                cleanText,
+                processIdentifier: activeTarget.processIdentifier
+            )
         } else {
             await ClipboardTransactionCoordinator.shared.paste(cleanText)
         }
         let didPaste: Bool
-        if let element = activeTarget.focusedElement,
+        if isInstantDictation {
+            // The keyboard event is posted only after the captured target is
+            // frontmost and its focused element has been revalidated. Keeping
+            // the clipboard alive briefly is necessary; waiting another half
+            // second for often-stale AXValue propagation is not. Native and
+            // Chromium editors can publish their old value after accepting the
+            // paste, which delayed the terminal HUD state without improving
+            // delivery safety.
+            didPaste = pasteWasPosted
+        } else if let element = activeTarget.focusedElement,
            let expectedPastedValue {
             didPaste = pasteWasPosted
                 ? await value(of: element, becomes: expectedPastedValue.value)
@@ -285,6 +388,10 @@ final class TextInjector: TextDelivering {
         if !didPaste {
             return fail(.clipboardPasteFailed)
         }
+        let completedStrategy = String(describing: lastDeliveryStrategy)
+        logger.notice(
+            "Delivery completed with strategy \(completedStrategy, privacy: .public) in \(Date().timeIntervalSince(deliveryStartedAt), format: .fixed(precision: 3), privacy: .public)s"
+        )
         return didPaste
     }
 
@@ -608,7 +715,8 @@ final class TextInjector: TextDelivering {
 
     private func restoreTargetApplication(
         _ application: NSRunningApplication,
-        processIdentifier: pid_t
+        processIdentifier: pid_t,
+        isInstantDictation: Bool
     ) async -> Bool {
         let frontmostProcessIdentifier = NSWorkspace.shared
             .frontmostApplication?.processIdentifier
@@ -632,7 +740,9 @@ final class TextInjector: TextDelivering {
         )
         if await waitForTargetApplication(
             processIdentifier,
-            timeout: .milliseconds(200)
+            timeout: isInstantDictation
+                ? .milliseconds(150)
+                : .milliseconds(200)
         ) {
             return true
         }
@@ -645,7 +755,9 @@ final class TextInjector: TextDelivering {
         )
         return await waitForTargetApplication(
             processIdentifier,
-            timeout: .seconds(1)
+            timeout: isInstantDictation
+                ? .milliseconds(350)
+                : .seconds(1)
         )
     }
 
@@ -931,16 +1043,17 @@ enum DeliveryPreferencePolicy {
         canWriteSelectedText && !prefersPaste
     }
 
-    static func shouldUseApplicationMenuPaste(
+    static func shouldUseTargetedPaste(
         prefersPaste: Bool,
         isInstantDictation: Bool
     ) -> Bool {
         prefersPaste && isInstantDictation
     }
+
 }
 
 enum BrowserFocusLossPastePolicy {
-    static func canUseApplicationMenuPaste(
+    static func canUseTargetedPaste(
         bundleIdentifier: String?,
         isInstantDictation: Bool,
         prefersPaste: Bool,
@@ -974,7 +1087,7 @@ enum MissingAccessibilityTargetPolicy {
     // instead of applying it to every Electron application.
     private static let compatibleBundleIdentifiers: Set<String> = ["com.openai.codex"]
 
-    static func canUseApplicationMenuPaste(
+    static func canUseTargetedPaste(
         bundleIdentifier: String?,
         isInstantDictation: Bool,
         prefersPaste: Bool,
@@ -995,19 +1108,6 @@ enum MissingAccessibilityTargetPolicy {
     }
 }
 
-enum ApplicationMenuPasteVerificationPolicy {
-    private static let staleAccessibilityValueBundleIdentifiers: Set<String> = [
-        "com.openai.codex"
-    ]
-
-    static func allowsStaleAccessibilityValue(
-        bundleIdentifier: String?
-    ) -> Bool {
-        bundleIdentifier.map(
-            staleAccessibilityValueBundleIdentifiers.contains
-        ) == true
-    }
-}
 #endif
 
 struct AccessibilityValueReplacement: Equatable {

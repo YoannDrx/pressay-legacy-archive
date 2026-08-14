@@ -107,8 +107,6 @@ final class ShortcutRouter: ObservableObject {
     private var monitoredDictationShortcut: ShortcutDefinition?
     private var nextHotKeyIdentifier: UInt32 = 10
     private var shortcutIsPressed = false
-    private var pendingRelease: DispatchWorkItem?
-    private var ignoresNextRelease = false
 
     var onShortcutPressed: (() -> Void)?
     var onShortcutReleased: (() -> Void)?
@@ -190,11 +188,8 @@ final class ShortcutRouter: ObservableObject {
             RemoveEventHandler(hotKeyEventHandler)
             self.hotKeyEventHandler = nil
         }
-        pendingRelease?.cancel()
-        pendingRelease = nil
         shortcutIsPressed = false
         monitoredDictationShortcut = nil
-        ignoresNextRelease = false
         isHandsFreeActive = false
         transformationShortcutAvailable = false
         correctionShortcutAvailable = false
@@ -375,9 +370,6 @@ final class ShortcutRouter: ObservableObject {
 
     private func handleKeyDown(_ event: NSEvent) {
         guard event.keyCode == UInt16(kVK_Escape) else { return }
-        pendingRelease?.cancel()
-        pendingRelease = nil
-        ignoresNextRelease = false
         if isHandsFreeActive {
             isHandsFreeActive = false
             onHandsFreeChanged?(false)
@@ -423,48 +415,20 @@ final class ShortcutRouter: ObservableObject {
     }
 
     private func handleHoldPressed() {
-        if isHandsFreeActive {
-            isHandsFreeActive = false
-            ignoresNextRelease = true
-            onHandsFreeChanged?(false)
-            DispatchQueue.main.async { [weak self] in
-                self?.onShortcutReleased?()
-            }
-            return
-        }
-
-        if let pendingRelease {
-            pendingRelease.cancel()
-            self.pendingRelease = nil
-            isHandsFreeActive = true
-            ignoresNextRelease = true
-            onHandsFreeChanged?(true)
-            return
-        }
-
         DispatchQueue.main.async { [weak self] in
             self?.onShortcutPressed?()
         }
     }
 
     private func handleHoldReleased() {
-        if ignoresNextRelease {
-            ignoresNextRelease = false
-            return
+        // A hold shortcut must stop on the physical key-up event. The former
+        // double-press detector deliberately delayed every dictation by 280 ms
+        // and kept the HUD in the listening state after Fn had been released.
+        // Hands-free dictation remains available through the explicit Bascule
+        // activation setting, so no debounce is needed on this critical path.
+        DispatchQueue.main.async { [weak self] in
+            self?.onShortcutReleased?()
         }
-        guard !isHandsFreeActive else { return }
-
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.pendingRelease = nil
-            self.onShortcutReleased?()
-        }
-        pendingRelease?.cancel()
-        pendingRelease = workItem
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + Constants.handsFreeDoublePressInterval,
-            execute: workItem
-        )
     }
 
     private func conflictingOwner(

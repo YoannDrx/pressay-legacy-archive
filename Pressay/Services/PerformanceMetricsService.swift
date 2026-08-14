@@ -399,3 +399,166 @@ enum MetricFailureClassifier {
         }
     }
 }
+
+struct APIUsageSummary: Equatable {
+    let requestCount: Int
+    let audioMinutes: Double
+    let estimatedUSD: Double
+    let unpricedRequestCount: Int
+}
+
+struct APIUsageEntry: Codable, Equatable, Identifiable {
+    enum Kind: String, Codable {
+        case transcription
+        case processing
+    }
+
+    let id: UUID
+    let createdAt: Date
+    let kind: Kind
+    let model: String
+    let audioDurationSeconds: TimeInterval?
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let estimatedUSD: Double?
+}
+
+enum OpenAICostEstimator {
+    // Snapshot of the public OpenAI pricing page on 2026-08-14. The panel
+    // clearly labels these values as estimates and links to actual usage.
+    static let pricingDate = "14 août 2026"
+
+    static func transcriptionUSD(
+        model: String,
+        audioDurationSeconds: TimeInterval
+    ) -> Double? {
+        let perMinute: Double? = switch model {
+        case "gpt-live-transcribe": 0.017
+        case "gpt-transcribe": 0.0045
+        case "gpt-4o-transcribe": 0.006
+        case "gpt-4o-mini-transcribe": 0.003
+        default: nil
+        }
+        guard let perMinute else { return nil }
+        return max(0, audioDurationSeconds) / 60 * perMinute
+    }
+
+    static func processingUSD(
+        model: String,
+        usage: OpenAITokenUsage
+    ) -> Double? {
+        let ratesPerMillion: (input: Double, output: Double)? = switch model {
+        case "gpt-5.6-luna": (0.10, 0.60)
+        default: nil
+        }
+        guard let ratesPerMillion else { return nil }
+        return Double(max(0, usage.inputTokens)) / 1_000_000
+            * ratesPerMillion.input
+            + Double(max(0, usage.outputTokens)) / 1_000_000
+            * ratesPerMillion.output
+    }
+}
+
+@MainActor
+final class APIUsageLedger: ObservableObject {
+    static let shared = APIUsageLedger()
+
+    @Published private(set) var revision = 0
+    private let defaults: UserDefaults
+    private let storageKey = "openai-api-usage-ledger-v1"
+    private let maximumEntries = 1_000
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func recordTranscription(
+        model: String,
+        audioDurationSeconds: TimeInterval,
+        at date: Date = Date()
+    ) {
+        guard !Constants.isRunningTests, audioDurationSeconds > 0 else { return }
+        append(
+            APIUsageEntry(
+                id: UUID(),
+                createdAt: date,
+                kind: .transcription,
+                model: model,
+                audioDurationSeconds: audioDurationSeconds,
+                inputTokens: nil,
+                outputTokens: nil,
+                estimatedUSD: OpenAICostEstimator.transcriptionUSD(
+                    model: model,
+                    audioDurationSeconds: audioDurationSeconds
+                )
+            )
+        )
+    }
+
+    func recordProcessing(
+        model: String,
+        usage: OpenAITokenUsage,
+        at date: Date = Date()
+    ) {
+        guard !Constants.isRunningTests else { return }
+        append(
+            APIUsageEntry(
+                id: UUID(),
+                createdAt: date,
+                kind: .processing,
+                model: model,
+                audioDurationSeconds: nil,
+                inputTokens: usage.inputTokens,
+                outputTokens: usage.outputTokens,
+                estimatedUSD: OpenAICostEstimator.processingUSD(
+                    model: model,
+                    usage: usage
+                )
+            )
+        )
+    }
+
+    func summary(since date: Date) -> APIUsageSummary {
+        let values = entries().filter { $0.createdAt >= date }
+        return APIUsageSummary(
+            requestCount: values.count,
+            audioMinutes: values.compactMap(\.audioDurationSeconds)
+                .reduce(0, +) / 60,
+            estimatedUSD: values.compactMap(\.estimatedUSD).reduce(0, +),
+            unpricedRequestCount: values.filter { $0.estimatedUSD == nil }.count
+        )
+    }
+
+    func reset() {
+        defaults.removeObject(forKey: storageKey)
+        revision += 1
+    }
+
+    private func append(_ entry: APIUsageEntry) {
+        var values = entries()
+        values.insert(entry, at: 0)
+        let cutoff = Calendar.current.date(
+            byAdding: .day,
+            value: -90,
+            to: Date()
+        ) ?? .distantPast
+        values = Array(
+            values.lazy
+                .filter { $0.createdAt >= cutoff }
+                .prefix(maximumEntries)
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(values) {
+            defaults.set(data, forKey: storageKey)
+            revision += 1
+        }
+    }
+
+    private func entries() -> [APIUsageEntry] {
+        guard let data = defaults.data(forKey: storageKey) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode([APIUsageEntry].self, from: data)) ?? []
+    }
+}

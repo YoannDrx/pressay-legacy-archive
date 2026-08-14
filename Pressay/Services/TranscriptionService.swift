@@ -4,15 +4,18 @@ struct TranscriptionResult: Equatable {
     let text: String
     let averageLogProbability: Double?
     let networkMetrics: NetworkRequestMetrics?
+    let modelIdentifier: String?
 
     init(
         text: String,
         averageLogProbability: Double?,
-        networkMetrics: NetworkRequestMetrics? = nil
+        networkMetrics: NetworkRequestMetrics? = nil,
+        modelIdentifier: String? = nil
     ) {
         self.text = text
         self.averageLogProbability = averageLogProbability
         self.networkMetrics = networkMetrics
+        self.modelIdentifier = modelIdentifier
     }
 
     var isLowConfidence: Bool {
@@ -109,16 +112,6 @@ final class TranscriptionService: SpeechTranscribing {
     private let session: URLSession
     private let apiKeyProvider: () -> String?
     private let defaults: UserDefaults
-    private let realtimeLock = NSLock()
-    private var realtimeSocket: URLSessionWebSocketTask?
-    private var realtimeAudioContinuation: AsyncStream<Data>.Continuation?
-    private var realtimeSenderTask: Task<Void, Error>?
-    private var realtimeReceiverTask: Task<Void, Never>?
-    private var realtimeCompletion: Result<TranscriptionResult, Error>?
-    private var realtimeWaiter: CheckedContinuation<TranscriptionResult, Error>?
-    private var realtimeReadyCompletion: Result<Void, Error>?
-    private var realtimeReadyWaiter: CheckedContinuation<Void, Error>?
-    private var realtimePendingAudio: [Data] = []
 
     var identifier: String { "openai" }
     var isReady: Bool { apiKeyProvider() != nil }
@@ -141,6 +134,9 @@ final class TranscriptionService: SpeechTranscribing {
         }
         self.apiKeyProvider = apiKeyProvider
         self.defaults = defaults
+        // Normalize short-lived model preferences as soon as the
+        // service is created, rather than waiting for the user's next dictation.
+        _ = OpenAITranscriptionProfile.current(in: defaults)
     }
 
     private struct TranscriptionResponse: Decodable {
@@ -166,16 +162,6 @@ final class TranscriptionService: SpeechTranscribing {
         let prompt: String?
     }
 
-    private struct RealtimeServerEvent: Decodable {
-        struct RealtimeError: Decodable {
-            let message: String
-        }
-
-        let type: String
-        let transcript: String?
-        let error: RealtimeError?
-    }
-
     func transcribe(audioURL: URL) async throws -> TranscriptionResult {
         // This method is normally entered from SessionCoordinator's MainActor.
         // Keychain access and multipart assembly are synchronous, so doing them
@@ -190,8 +176,11 @@ final class TranscriptionService: SpeechTranscribing {
         let language = defaults.string(forKey: Constants.transcriptionLanguageKey)
             ?? Constants.defaultTranscriptionLanguage
         let vocabulary = Self.selectedVocabulary(preferences: defaults)
-        let model = defaults.string(forKey: Constants.transcriptionModelKey)
-            ?? Constants.defaultTranscriptionModel
+        // Pressay deliberately uses one Mini completed-file request after Fn
+        // is released. This avoids a Realtime socket, finalization handshake,
+        // fallback race and any unnoticed switch to a different model.
+        let model = OpenAITranscriptionProfile.current(in: defaults)
+            .primaryModel
         let prepared = try await Task.detached(priority: .userInitiated) {
             try Self.prepareRequest(
                 audioURL: audioURL,
@@ -261,316 +250,9 @@ final class TranscriptionService: SpeechTranscribing {
         return TranscriptionResult(
             text: cleanText,
             averageLogProbability: averageLogProbability,
-            networkMetrics: .combined(requestMetrics)
+            networkMetrics: .combined(requestMetrics),
+            modelIdentifier: model
         )
-    }
-
-    func startRealtimeTranscription() async throws {
-        let apiKeyProvider = self.apiKeyProvider
-        let apiKey = try await Task.detached(priority: .userInitiated) {
-            guard let apiKey = apiKeyProvider() else {
-                throw TranscriptionError.noAPIKey
-            }
-            return apiKey
-        }.value
-        guard let url = URL(
-            string: "wss://api.openai.com/v1/realtime?intent=transcription"
-        ) else { throw TranscriptionError.invalidURL }
-
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 15
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        let socket = session.webSocketTask(with: request)
-        let (audioStream, continuation) = AsyncStream<Data>.makeStream()
-
-        let pendingAudio = installRealtimeState(
-            socket: socket,
-            continuation: continuation
-        )
-        pendingAudio.forEach { continuation.yield($0) }
-
-        socket.resume()
-        realtimeReceiverTask = Task { [weak self, socket] in
-            while !Task.isCancelled {
-                do {
-                    self?.handleRealtime(try await socket.receive())
-                } catch {
-                    guard !Task.isCancelled else { return }
-                    self?.completeRealtimeReady(.failure(error))
-                    self?.completeRealtime(.failure(error))
-                    return
-                }
-            }
-        }
-
-        do {
-            try await socket.send(.string(try realtimeSessionUpdate()))
-            let timeout = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(6))
-                guard !Task.isCancelled else { return }
-                self?.completeRealtimeReady(
-                    .failure(TranscriptionError.realtimeTimeout)
-                )
-            }
-            defer { timeout.cancel() }
-            try await waitForRealtimeReady()
-        } catch {
-            cancelRealtimeTranscription()
-            throw error
-        }
-
-        realtimeSenderTask = Task { [weak self, socket] in
-            do {
-                for await chunk in audioStream {
-                    try Task.checkCancellation()
-                    try await socket.send(
-                        .string(try Self.audioAppendEvent(for: chunk))
-                    )
-                }
-            } catch {
-                self?.completeRealtime(.failure(error))
-                throw error
-            }
-        }
-    }
-
-    func appendRealtimeAudio(_ data: Data) {
-        realtimeLock.lock()
-        let continuation = realtimeAudioContinuation
-        if continuation == nil {
-            realtimePendingAudio.append(data)
-        }
-        realtimeLock.unlock()
-        continuation?.yield(data)
-    }
-
-    func finishRealtimeTranscription() async throws -> TranscriptionResult {
-        let (continuation, sender, socket) = realtimeFinishState()
-
-        guard let socket else { throw TranscriptionError.realtimeUnavailable }
-        defer { cancelRealtimeTranscription() }
-        continuation?.finish()
-        try await sender?.value
-        try await socket.send(
-            .string("{\"type\":\"input_audio_buffer.commit\"}")
-        )
-
-        let timeout = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(6))
-            guard !Task.isCancelled else { return }
-            self?.completeRealtime(.failure(TranscriptionError.realtimeTimeout))
-        }
-        defer { timeout.cancel() }
-        return try await waitForRealtimeCompletion()
-    }
-
-    func cancelRealtimeTranscription() {
-        realtimeLock.lock()
-        let socket = realtimeSocket
-        let continuation = realtimeAudioContinuation
-        let sender = realtimeSenderTask
-        let receiver = realtimeReceiverTask
-        let waiter = realtimeWaiter
-        let readyWaiter = realtimeReadyWaiter
-        realtimeSocket = nil
-        realtimeAudioContinuation = nil
-        realtimeSenderTask = nil
-        realtimeReceiverTask = nil
-        realtimeCompletion = nil
-        realtimeWaiter = nil
-        realtimeReadyCompletion = nil
-        realtimeReadyWaiter = nil
-        realtimePendingAudio.removeAll(keepingCapacity: true)
-        realtimeLock.unlock()
-
-        continuation?.finish()
-        sender?.cancel()
-        receiver?.cancel()
-        socket?.cancel(with: .goingAway, reason: nil)
-        waiter?.resume(throwing: CancellationError())
-        readyWaiter?.resume(throwing: CancellationError())
-    }
-
-    private func installRealtimeState(
-        socket: URLSessionWebSocketTask,
-        continuation: AsyncStream<Data>.Continuation
-    ) -> [Data] {
-        realtimeLock.lock()
-        defer { realtimeLock.unlock() }
-        realtimeSocket = socket
-        realtimeAudioContinuation = continuation
-        realtimeCompletion = nil
-        realtimeWaiter = nil
-        realtimeReadyCompletion = nil
-        realtimeReadyWaiter = nil
-        let pending = realtimePendingAudio
-        realtimePendingAudio.removeAll(keepingCapacity: true)
-        return pending
-    }
-
-    private func realtimeFinishState() -> (
-        AsyncStream<Data>.Continuation?,
-        Task<Void, Error>?,
-        URLSessionWebSocketTask?
-    ) {
-        realtimeLock.lock()
-        defer { realtimeLock.unlock() }
-        let state = (
-            realtimeAudioContinuation,
-            realtimeSenderTask,
-            realtimeSocket
-        )
-        realtimeAudioContinuation = nil
-        return state
-    }
-
-    private func realtimeSessionUpdate() throws -> String {
-        let language = defaults.string(forKey: Constants.transcriptionLanguageKey)
-            ?? Constants.defaultTranscriptionLanguage
-        let vocabulary = Self.selectedVocabulary(preferences: defaults)
-        let keywords = vocabulary
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        var transcription: [String: Any] = [
-            "model": "gpt-live-transcribe",
-            "delay": "minimal"
-        ]
-        if !language.isEmpty { transcription["languages"] = [language] }
-        if !keywords.isEmpty { transcription["keywords"] = keywords }
-        if let prompt = Self.transcriptionPrompt(
-            vocabulary: vocabulary,
-            language: language,
-            model: "gpt-live-transcribe"
-        ) {
-            transcription["prompt"] = prompt
-        }
-        let event: [String: Any] = [
-            "type": "session.update",
-            "session": [
-                "type": "transcription",
-                "audio": [
-                    "input": [
-                        "format": ["type": "audio/pcm", "rate": 24_000],
-                        "transcription": transcription,
-                        "turn_detection": NSNull()
-                    ]
-                ]
-            ]
-        ]
-        return String(
-            decoding: try JSONSerialization.data(withJSONObject: event),
-            as: UTF8.self
-        )
-    }
-
-    private static func audioAppendEvent(for data: Data) throws -> String {
-        let event: [String: Any] = [
-            "type": "input_audio_buffer.append",
-            "audio": data.base64EncodedString()
-        ]
-        return String(
-            decoding: try JSONSerialization.data(withJSONObject: event),
-            as: UTF8.self
-        )
-    }
-
-    private func handleRealtime(_ message: URLSessionWebSocketTask.Message) {
-        let data: Data
-        switch message {
-        case .data(let value): data = value
-        case .string(let value): data = Data(value.utf8)
-        @unknown default: return
-        }
-        guard let event = try? JSONDecoder().decode(
-            RealtimeServerEvent.self,
-            from: data
-        ) else { return }
-        switch event.type {
-        case "session.updated":
-            completeRealtimeReady(.success(()))
-        case "conversation.item.input_audio_transcription.completed":
-            do {
-                let vocabulary = Self.selectedVocabulary(preferences: defaults)
-                let text = try TranscriptionResponseValidator.validated(
-                    event.transcript ?? "",
-                    vocabulary: vocabulary
-                )
-                completeRealtime(
-                    .success(
-                        TranscriptionResult(
-                            text: text,
-                            averageLogProbability: nil
-                        )
-                    )
-                )
-            } catch {
-                completeRealtime(.failure(error))
-            }
-        case "error":
-            let error = TranscriptionError.apiError(
-                event.error?.message
-                    ?? "Échec de la transcription temps réel"
-            )
-            completeRealtimeReady(.failure(error))
-            completeRealtime(.failure(error))
-        default:
-            break
-        }
-    }
-
-    private func completeRealtime(
-        _ result: Result<TranscriptionResult, Error>
-    ) {
-        realtimeLock.lock()
-        guard realtimeCompletion == nil else {
-            realtimeLock.unlock()
-            return
-        }
-        realtimeCompletion = result
-        let waiter = realtimeWaiter
-        realtimeWaiter = nil
-        realtimeLock.unlock()
-        waiter?.resume(with: result)
-    }
-
-    private func completeRealtimeReady(_ result: Result<Void, Error>) {
-        realtimeLock.lock()
-        guard realtimeReadyCompletion == nil else {
-            realtimeLock.unlock()
-            return
-        }
-        realtimeReadyCompletion = result
-        let waiter = realtimeReadyWaiter
-        realtimeReadyWaiter = nil
-        realtimeLock.unlock()
-        waiter?.resume(with: result)
-    }
-
-    private func waitForRealtimeReady() async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            realtimeLock.lock()
-            if let result = realtimeReadyCompletion {
-                realtimeLock.unlock()
-                continuation.resume(with: result)
-            } else {
-                realtimeReadyWaiter = continuation
-                realtimeLock.unlock()
-            }
-        }
-    }
-
-    private func waitForRealtimeCompletion() async throws -> TranscriptionResult {
-        try await withCheckedThrowingContinuation { continuation in
-            realtimeLock.lock()
-            if let result = realtimeCompletion {
-                realtimeLock.unlock()
-                continuation.resume(with: result)
-            } else {
-                realtimeWaiter = continuation
-                realtimeLock.unlock()
-            }
-        }
     }
 
     private static func prepareRequest(
@@ -589,6 +271,7 @@ final class TranscriptionService: SpeechTranscribing {
             audioURL: audioURL,
             model: model,
             language: language,
+            vocabulary: vocabulary,
             prompt: prompt
         )
 
@@ -621,10 +304,11 @@ final class TranscriptionService: SpeechTranscribing {
         }
     }
 
-    private static func makeBody(
+    static func makeBody(
         audioURL: URL,
         model: String,
         language: String,
+        vocabulary: String,
         prompt: String?
     ) throws -> (data: Data, boundary: String) {
         let boundary = UUID().uuidString
@@ -652,12 +336,30 @@ final class TranscriptionService: SpeechTranscribing {
                 value: "logprobs"
             )
         }
-        if !language.isEmpty {
+        if !language.isEmpty,
+           TranscriptionRequestPolicy.supportsMultipleLanguageHints(
+               model: model
+           ) {
+            data.appendMultipartField(
+                boundary: boundary,
+                name: "languages[]",
+                value: language
+            )
+        } else if !language.isEmpty {
             data.appendMultipartField(
                 boundary: boundary,
                 name: "language",
                 value: language
             )
+        }
+        if TranscriptionRequestPolicy.supportsKeywords(model: model) {
+            for keyword in sanitizedKeywords(from: vocabulary) {
+                data.appendMultipartField(
+                    boundary: boundary,
+                    name: "keywords[]",
+                    value: keyword
+                )
+            }
         }
         if let prompt {
             data.appendMultipartField(
@@ -741,6 +443,35 @@ final class TranscriptionService: SpeechTranscribing {
         }
     }
 
+    static func sanitizedKeywords(from vocabulary: String) -> [String] {
+        let forbidden = CharacterSet.alphanumerics
+            .union(.whitespaces)
+            .union(CharacterSet(charactersIn: "-'’._+#"))
+            .inverted
+        var seen = Set<String>()
+        var result: [String] = []
+        for rawValue in vocabulary.components(
+            separatedBy: CharacterSet(charactersIn: ",\n\r")
+        ) {
+            let scalars = rawValue.unicodeScalars.filter {
+                !forbidden.contains($0)
+            }
+            let clean = String(String.UnicodeScalarView(scalars))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefix(64)
+            guard !clean.isEmpty else { continue }
+            let value = String(clean)
+            let key = value.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: .current
+            )
+            guard seen.insert(key).inserted else { continue }
+            result.append(value)
+            if result.count == 50 { break }
+        }
+        return result
+    }
+
     private static func transcriptionPrompt(
         vocabulary: String,
         language: String,
@@ -749,7 +480,10 @@ final class TranscriptionService: SpeechTranscribing {
         if model == "whisper-1" {
             return vocabulary.isEmpty ? nil : vocabulary
         }
-        let vocabularyGuidance = vocabulary.isEmpty
+        // GPT Transcribe receives vocabulary through keywords[]. Repeating the
+        // whole list in the prompt increases payload size and can make the
+        // vocabulary itself look like dictated speech.
+        let vocabularyGuidance = vocabulary.isEmpty || model == "gpt-transcribe"
             ? ""
             : language == "en"
                 ? " Expected technical vocabulary: \(vocabulary)."
@@ -772,8 +506,6 @@ final class TranscriptionService: SpeechTranscribing {
             message: String?,
             retryAfter: TimeInterval?
         )
-        case realtimeUnavailable
-        case realtimeTimeout
 
         var errorDescription: String? {
             switch self {
@@ -794,22 +526,24 @@ final class TranscriptionService: SpeechTranscribing {
                     return "OpenAI (HTTP \(status)) : \(message)"
                 }
                 return "OpenAI a répondu avec l’erreur HTTP \(status)"
-            case .realtimeUnavailable:
-                return "La transcription temps réel n’est pas disponible"
-            case .realtimeTimeout:
-                return "La transcription temps réel n’a pas finalisé à temps"
             }
         }
     }
 }
-
-extension TranscriptionService: RealtimeSpeechTranscribing {}
 
 enum TranscriptionRequestPolicy {
     static func supportsLogProbabilities(model: String) -> Bool {
         model.hasPrefix("gpt-4o-")
             && model.contains("transcribe")
             && !model.contains("diarize")
+    }
+
+    static func supportsMultipleLanguageHints(model: String) -> Bool {
+        model == "gpt-transcribe"
+    }
+
+    static func supportsKeywords(model: String) -> Bool {
+        model == "gpt-transcribe"
     }
 }
 

@@ -74,6 +74,27 @@ struct PressayDevice: Codable, Equatable, Identifiable, Sendable {
     let lastSeenAt: Date
 }
 
+/// Wire payload for `POST /v1/devices/register`.
+///
+/// The Pressay API deliberately uses camelCase for request bodies. Keep this
+/// separate from `PressayJSON.encoder`, which uses snake_case for local cached
+/// values, so a storage-format change can never break the account handshake.
+struct PressayDeviceRegistration: Encodable, Equatable, Sendable {
+    let deviceIdentifier: String
+    let platform: String
+    let appVersion: String
+    let distributionChannel: String
+    let architecture: String
+    let osMajor: Int
+    let transcriptionEngine: String
+    let localModelID: String?
+    let telemetryConsent: Bool
+
+    func encodedForAPI() throws -> Data {
+        try JSONEncoder().encode(self)
+    }
+}
+
 struct PressayEntitlement: Codable, Equatable, Sendable {
     struct TimelineItem: Codable, Equatable, Sendable {
         let source: String
@@ -193,7 +214,19 @@ enum PressayAccountError: LocalizedError, Equatable {
 
 @MainActor
 final class AccountService: NSObject, ObservableObject {
-    static let shared = AccountService()
+    static let shared: AccountService = {
+        // Hosted macOS tests construct the complete SwiftUI Settings scene
+        // before XCTest starts. Never let that implicit view construction read
+        // production OAuth tokens: a code-signing ACL prompt can otherwise
+        // block the test host (and SecurityAgent) indefinitely.
+        if Constants.isRunningTests {
+            return AccountService(
+                configuration: nil,
+                keychain: EmptyAccountKeychainStore()
+            )
+        }
+        return AccountService()
+    }()
 
     enum State: Equatable {
         case unavailable
@@ -242,6 +275,7 @@ final class AccountService: NSObject, ObservableObject {
     private let session: URLSession
     private var authenticationSession: ASWebAuthenticationSession?
     private var tokens: TokenSet?
+    private lazy var currentDeviceIdentifier = stableDeviceIdentifier()
 
     init(
         configuration: PressayCloudConfiguration? = .current,
@@ -253,7 +287,10 @@ final class AccountService: NSObject, ObservableObject {
         self.keychain = keychain
         self.defaults = defaults
         self.session = session
-        if let data = keychain.data(account: Constants.keychainAccountTokensAccount) {
+        if !Constants.isRunningTests,
+           let data = keychain.data(
+               account: Constants.keychainAccountTokensAccount
+           ) {
             self.tokens = try? PressayJSON.decoder.decode(TokenSet.self, from: data)
         }
         self.state = configuration == nil ? .unavailable : (tokens == nil ? .signedOut : .loading)
@@ -360,6 +397,10 @@ final class AccountService: NSObject, ObservableObject {
         }
     }
 
+    func isCurrentDevice(_ device: PressayDevice) -> Bool {
+        device.deviceIdentifier == currentDeviceIdentifier
+    }
+
     static func codeChallenge(for verifier: String) -> String {
         let digest = SHA256.hash(data: Data(verifier.utf8))
         return Data(digest).base64URLEncodedString()
@@ -410,28 +451,19 @@ final class AccountService: NSObject, ObservableObject {
     }
 
     private func registerThisMac() async throws {
-        struct Registration: Encodable {
-            let deviceIdentifier: String
-            let platform = "macos"
-            let appVersion: String
-            let distributionChannel = "direct"
-            let architecture: String
-            let osMajor: Int
-            let transcriptionEngine: String
-            let localModelID: String?
-            let telemetryConsent: Bool
-        }
         let consent = defaults.bool(forKey: Constants.remoteTelemetryEnabledKey)
-        let registration = Registration(
-            deviceIdentifier: stableDeviceIdentifier(),
+        let registration = PressayDeviceRegistration(
+            deviceIdentifier: currentDeviceIdentifier,
+            platform: "macos",
             appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+            distributionChannel: "direct",
             architecture: Self.architecture,
             osMajor: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,
             transcriptionEngine: defaults.string(forKey: Constants.transcriptionEngineKey) ?? "unknown",
             localModelID: consent ? defaults.string(forKey: Constants.whisperKitModelPathKey) : nil,
             telemetryConsent: consent
         )
-        let body = try PressayJSON.encoder.encode(registration)
+        let body = try registration.encodedForAPI()
         _ = try await apiRequest(path: "devices/register", method: "POST", body: body)
     }
 
@@ -635,6 +667,12 @@ final class AccountService: NSObject, ObservableObject {
         "data.export",
         "data.delete"
     ]
+}
+
+private final class EmptyAccountKeychainStore: KeychainStoring {
+    func save(data: Data, account: String) -> Bool { false }
+    func data(account: String) -> Data? { nil }
+    func delete(account: String) -> Bool { true }
 }
 
 extension AccountService: ASWebAuthenticationPresentationContextProviding {

@@ -7,7 +7,6 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var hasPermission = false
     var onLevelUpdate: ((Float) -> Void)?
-    var onPCMChunk: ((Data) -> Void)?
 
     private var audioEngine: AVAudioEngine?
     private var audioConverter: AVAudioConverter?
@@ -15,8 +14,6 @@ final class AudioRecorder: NSObject, ObservableObject {
     private var recordingURL: URL?
     private var powerSamples: [Float] = []
     private var recordedFrames: AVAudioFramePosition = 0
-    private var pendingPCMChunks: [Data] = []
-    private var streamingGateOpen = false
     private var inputTapInstalled = false
     private let processingQueue = DispatchQueue(
         label: "fr.yodev.pressay.audio-processing",
@@ -82,8 +79,6 @@ final class AudioRecorder: NSObject, ObservableObject {
         audioFile = file
         recordingURL = url
         powerSamples = []
-        pendingPCMChunks = []
-        streamingGateOpen = false
         recordedFrames = 0
         input.installTap(onBus: 0, bufferSize: 4_096, format: inputFormat) {
             [weak self] buffer, _ in
@@ -139,8 +134,6 @@ final class AudioRecorder: NSObject, ObservableObject {
             interval: interval
         )
         powerSamples = []
-        pendingPCMChunks = []
-        streamingGateOpen = false
         return CapturedAudio(
             url: recordingURL,
             duration: duration,
@@ -167,8 +160,6 @@ final class AudioRecorder: NSObject, ObservableObject {
             self.recordingURL = nil
         }
         powerSamples = []
-        pendingPCMChunks = []
-        streamingGateOpen = false
         recordedFrames = 0
         onLevelUpdate?(0)
     }
@@ -220,39 +211,8 @@ final class AudioRecorder: NSObject, ObservableObject {
         if duration >= Constants.ignoredLeadingAudioDuration {
             powerSamples.append(power)
         }
-        if let samples = output.int16ChannelData?.pointee {
-            let chunk = Data(
-                bytes: samples,
-                count: Int(output.frameLength) * MemoryLayout<Int16>.size
-            )
-            emitAfterSpeechGate(chunk, duration: duration)
-        }
         let normalized = max(0, min(1, (power + 60) / 60))
         onLevelUpdate?(normalized)
-    }
-
-    private func emitAfterSpeechGate(_ chunk: Data, duration: TimeInterval) {
-        if streamingGateOpen {
-            onPCMChunk?(chunk)
-            return
-        }
-        pendingPCMChunks.append(chunk)
-        guard !powerSamples.isEmpty else { return }
-        let interval = max(
-            0.001,
-            (duration - Constants.ignoredLeadingAudioDuration)
-                / Double(powerSamples.count)
-        )
-        let detection = SpeechDetectionPolicy.analyze(
-            powers: powerSamples,
-            duration: duration,
-            interval: interval
-        )
-        guard detection.containsSpeech else { return }
-        streamingGateOpen = true
-        let buffered = pendingPCMChunks
-        pendingPCMChunks.removeAll(keepingCapacity: true)
-        buffered.forEach { onPCMChunk?($0) }
     }
 
     private func averagePower(from buffer: AVAudioPCMBuffer) -> Float {
@@ -284,4 +244,3 @@ final class AudioRecorder: NSObject, ObservableObject {
 }
 
 extension AudioRecorder: AudioCapturing {}
-extension AudioRecorder: PCMChunkProviding {}

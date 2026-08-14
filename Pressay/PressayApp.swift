@@ -354,9 +354,45 @@ private struct OnboardingView: View {
 }
 
 @MainActor
+private final class MenuBarPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+enum MenuBarPanelPlacement {
+    static func frame(
+        anchor: NSRect,
+        visibleFrame: NSRect,
+        size: NSSize,
+        margin: CGFloat = 8,
+        gap: CGFloat = 5
+    ) -> NSRect {
+        // Keep the icon close to the panel's upper-left corner. This matches
+        // the visual origin of native menu-bar panels and avoids the panel
+        // appearing detached in the middle of the screen.
+        let proposedX = anchor.minX - 8
+        let x = min(
+            max(proposedX, visibleFrame.minX + margin),
+            visibleFrame.maxX - size.width - margin
+        )
+        let proposedY = anchor.minY - size.height - gap
+        let y = min(
+            max(proposedY, visibleFrame.minY + margin),
+            visibleFrame.maxY - size.height
+        )
+        return NSRect(origin: NSPoint(x: x, y: y), size: size)
+    }
+}
+
+@MainActor
 final class StatusItemController: NSObject, ObservableObject {
     private let statusItem: NSStatusItem
-    private let popover = NSPopover()
+    private let panel = MenuBarPanel(
+        contentRect: NSRect(x: 0, y: 0, width: 380, height: 640),
+        styleMask: [.borderless, .nonactivatingPanel],
+        backing: .buffered,
+        defer: false
+    )
     private let appState: AppState
     private let updateService: UpdateService
     private var observations = Set<AnyCancellable>()
@@ -373,20 +409,21 @@ final class StatusItemController: NSObject, ObservableObject {
 
         statusItem.isVisible = true
         let rootView = MenuBarView { [weak self] in
-            self?.closePopover()
+            self?.closePanel()
         }
             .environmentObject(appState)
             .environmentObject(updateService)
         let hostingController = NSHostingController(rootView: rootView)
-        popover.contentViewController = hostingController
-        popover.behavior = .transient
-        popover.animates = true
-        hostingController.view.layoutSubtreeIfNeeded()
-        let fittingHeight = hostingController.view.fittingSize.height
-        popover.contentSize = NSSize(
-            width: 316,
-            height: min(max(fittingHeight, 360), 720)
-        )
+        panel.contentViewController = hostingController
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.animationBehavior = .utilityWindow
 
         if let button = statusItem.button {
             button.isEnabled = true
@@ -421,19 +458,40 @@ final class StatusItemController: NSObject, ObservableObject {
     }
 
     @objc private func togglePopover(_ sender: NSStatusBarButton) {
-        if popover.isShown {
-            popover.performClose(sender)
+        if panel.isVisible {
+            closePanel()
             return
         }
 
-        // Keep the destination application frontmost. Activating Pressay here
-        // makes a dictation started from the popover capture Pressay itself as
-        // the target, so delivery can only fall back to the pasteboard.
-        popover.show(
-            relativeTo: sender.bounds,
-            of: sender,
-            preferredEdge: .minY
+        positionPanel(relativeTo: sender)
+        panel.animationBehavior = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            ? .none
+            : .utilityWindow
+        NotificationCenter.default.post(name: .pressayMenuPanelWillOpen, object: nil)
+
+        // The non-activating panel can receive clicks and keyboard navigation
+        // without making Pressay the active application. The application that
+        // was frontmost therefore remains the destination of the next dictation.
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func positionPanel(relativeTo sender: NSStatusBarButton) {
+        guard let statusWindow = sender.window else { return }
+        let anchor = statusWindow.convertToScreen(sender.convert(sender.bounds, to: nil))
+        let screen = statusWindow.screen ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1_440, height: 900)
+        let width: CGFloat = 380
+        let height = min(660, max(560, visible.height - 18))
+        let margin: CGFloat = 8
+
+        let frame = MenuBarPanelPlacement.frame(
+            anchor: anchor,
+            visibleFrame: visible,
+            size: NSSize(width: width, height: height),
+            margin: margin
         )
+        panel.setFrame(frame, display: true)
     }
 
     private func installOutsideClickMonitors() {
@@ -446,11 +504,10 @@ final class StatusItemController: NSObject, ObservableObject {
         localMouseMonitor = NSEvent.addLocalMonitorForEvents(
             matching: mouseEvents
         ) { [weak self] event in
-            guard let self, self.popover.isShown else { return event }
-            let popoverWindow = self.popover.contentViewController?.view.window
+            guard let self, self.panel.isVisible else { return event }
             let statusItemWindow = self.statusItem.button?.window
-            if event.window !== popoverWindow && event.window !== statusItemWindow {
-                self.closePopover()
+            if event.window !== self.panel && event.window !== statusItemWindow {
+                self.closePanel()
             }
             return event
         }
@@ -459,14 +516,14 @@ final class StatusItemController: NSObject, ObservableObject {
             matching: mouseEvents
         ) { [weak self] _ in
             DispatchQueue.main.async {
-                self?.closePopover()
+                self?.closePanel()
             }
         }
     }
 
-    private func closePopover() {
-        guard popover.isShown else { return }
-        popover.performClose(nil)
+    private func closePanel() {
+        guard panel.isVisible else { return }
+        panel.orderOut(nil)
     }
 
     private func updateStatusItem() {

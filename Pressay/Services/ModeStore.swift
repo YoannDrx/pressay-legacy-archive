@@ -195,7 +195,6 @@ final class ModeStore: ObservableObject {
 
     var visibleModes: [ModeDefinition] {
         NativeModeCatalog.visibleModes
-            .filter(hasCommercialAccess)
             .map(applyingOverrides)
             + customModes
                 .filter { $0.isEnabled && hasCommercialAccess(to: $0) }
@@ -316,17 +315,18 @@ final class ModeStore: ObservableObject {
         if !isBuiltIn(mode.id) {
             return AccountService.shared.allows("modes.custom")
         }
+        // The twelve native writing styles are part of Pressay's core BYOK
+        // experience. Account entitlements still govern custom modes,
+        // application profiles and selection transformation, but must never
+        // make built-in styles disappear from an existing installation.
+        if mode.id != NativeModeCatalog.transformSelectionID {
+            return true
+        }
         switch mode.id {
-        case NativeModeCatalog.faithfulID:
-            return AccountService.shared.allows("modes.faithful")
-        case NativeModeCatalog.cleanID:
-            return AccountService.shared.allows("modes.clean")
-        case NativeModeCatalog.messageID:
-            return AccountService.shared.allows("modes.message")
         case NativeModeCatalog.transformSelectionID:
             return AccountService.shared.allows("transformations.unlimited_byok")
         default:
-            return AccountService.shared.allows("modes.all")
+            return true
         }
     }
 

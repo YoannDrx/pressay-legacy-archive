@@ -49,11 +49,33 @@ La cible `PressayTests` couvre :
 - fusion de trois releases stables et cinq bêtas dans l’appcast.
 - restauration exacte d'un presse-papiers riche et multi-item après insertion,
   avec préservation d'une copie concurrente de l'utilisateur.
+- parcours de dictée simple par un unique `⌘V` global, sans WebSocket ni flux
+  PCM parallèle ;
+- migration des anciens profils Live/GPT Transcribe vers Mini ;
+- corps des requêtes Mini, GPT Transcribe et Responses, langue cible de
+  Traduction, borne des jetons de sortie et option de traitement rapide.
 
-La suite contient actuellement **114 tests Swift et 2 tests Python actifs**.
+La suite contient actuellement **152 tests Swift (dont 1 ignoré) et 2 tests Python actifs**.
 Les anciens scénarios multi-provider/OIDC placés derrière `#if false` ne sont
 pas comptés. Cette suite ne remplace ni les tests AX réels ni la matrice
 interapplications.
+
+Le smoke test OpenAI réel reste explicitement opt-in et lit la clé depuis le
+Trousseau, sans l'écrire dans le dépôt ou les logs :
+
+```bash
+OTHER_SWIFT_FLAGS='$(inherited) -D OPENAI_SMOKE' \
+  xcodebuild test \
+  -project Pressay.xcodeproj \
+  -scheme Pressay \
+  -configuration Debug \
+  -destination 'platform=macOS' \
+  -only-testing:PressayTests/OpenAISmokeTests/testMiniTranscribeAndResponsesAgainstOpenAI
+```
+
+Il vérifie sur un audio synthétique non sensible la transcription de fichier
+GPT-4o Mini et une transformation Responses rapide. Il n'affiche que les durées
+et jamais la transcription ou la clé.
 
 ## Vérifications de release automatisées
 

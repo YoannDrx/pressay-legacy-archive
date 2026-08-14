@@ -116,23 +116,12 @@ protocol AudioCapturing: AnyObject {
     func cleanup(url: URL)
 }
 
-protocol PCMChunkProviding: AnyObject {
-    var onPCMChunk: ((Data) -> Void)? { get set }
-}
-
 protocol SpeechTranscribing: AnyObject {
     var identifier: String { get }
     var isReady: Bool { get }
     var locality: ProviderLocality { get }
     func prepare() async throws
     func transcribe(audioURL: URL) async throws -> TranscriptionResult
-}
-
-protocol RealtimeSpeechTranscribing: SpeechTranscribing {
-    func startRealtimeTranscription() async throws
-    func appendRealtimeAudio(_ data: Data)
-    func finishRealtimeTranscription() async throws -> TranscriptionResult
-    func cancelRealtimeTranscription()
 }
 
 extension SpeechTranscribing {
@@ -150,16 +139,24 @@ struct TextProcessingResult: Equatable {
     let text: String
     let providerIdentifier: String
     let networkMetrics: NetworkRequestMetrics?
+    let tokenUsage: OpenAITokenUsage?
 
     init(
         text: String,
         providerIdentifier: String,
-        networkMetrics: NetworkRequestMetrics? = nil
+        networkMetrics: NetworkRequestMetrics? = nil,
+        tokenUsage: OpenAITokenUsage? = nil
     ) {
         self.text = text
         self.providerIdentifier = providerIdentifier
         self.networkMetrics = networkMetrics
+        self.tokenUsage = tokenUsage
     }
+}
+
+struct OpenAITokenUsage: Codable, Equatable, Sendable {
+    let inputTokens: Int
+    let outputTokens: Int
 }
 
 protocol TextProcessing: AnyObject {

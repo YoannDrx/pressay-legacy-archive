@@ -97,5 +97,5 @@ python3 "$project_root/scripts/test-merge-appcast.py"
 python3 -m py_compile "$project_root/scripts/verify-public-appcast.py"
 
 echo "Pressay est techniquement prête pour les validations manuelles de publication."
-echo "Direct: 1.2.7 (12106), $direct_architectures"
+echo "Direct: 1.2.8 (12107), $direct_architectures"
 echo "Mac App Store: 1.2.0 (12005), validation sandbox universelle réussie"
